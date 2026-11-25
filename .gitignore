@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.zip
+package/VDOT_LRS_Linear_Milepost/wheels/
+tests/*.json
+tests/*.png

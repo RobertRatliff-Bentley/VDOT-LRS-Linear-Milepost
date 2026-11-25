@@ -1,0 +1,1558 @@
+Option Explicit
+' VDOT LRS Linear Milepost - the dialog.
+'
+' The drop-downs, buttons, log frame and logo are design-time controls (see the form in the
+' VBA editor). Everything else - cards, captions, positions, colours - is laid out in code
+' by BuildLayout and ApplyTheme below.
+
+Private Const FORM_WIDTH As Single = 390
+Private Const BUTTONS_TOP As Single = 482           ' Close / Create row with the log open
+Private Const LOG_TOP As Single = 422
+Private Const LOG_HEIGHT As Single = 54
+Private Const OFFER_HEIGHT As Single = 30
+Private Const MAX_LOG_LINES As Long = 300
+
+Private mService As clsLrsService
+Private mRoute As clsLrsRoute
+Private mShape As clsLrsGeometry                 ' the route in master units of the model
+Private mRoutePreview() As Element, mRoutePreviewCount As Long
+Private mEventPreview() As Element, mEventPreviewCount As Long
+Private mEventType As String
+Private mNextPick As String
+Private mOfferOpen As Boolean
+Private mOfferAction As String
+Private mOfferDeclined As String
+Private lblOffer As MSForms.Label
+Private mLastPrompt As String
+
+Private mJurNames() As String, mJurLower() As String, mJurValues() As String
+Private mJurCount As Long, mJurIndex As Long
+Private mRouteNames() As String, mRouteLower() As String, mRouteIds() As String
+Private mRouteCount As Long, mRouteIndex As Long
+Private mCoordModes() As String, mCoordCodes() As Long
+
+Private mBusy As Boolean            ' True while the code itself changes a control
+Private mKeyHeld As Boolean         ' True between KeyDown and KeyUp
+Private mKeyNav As Boolean          ' the held key moves through the list
+Private mConnected As Boolean
+Private mLoading As Boolean         ' True while a service request is running
+Private mCloseRequested As Boolean  ' the dialog was closed during a request
+Private mLastFromText As String, mLastToText As String
+Private mLastEventKey As String     ' the event the preview was last built for
+Private mStatusText As String, mStatusStep As Long, mStatusTick As Double
+Private mLogText As String, mLogLines As Collection, mLogBottom As Single, mLogOpen As Boolean
+
+Private lblStatus As MSForms.Label
+Private lblRouteHint As MSForms.Label
+Private lblFrom As MSForms.Label
+Private lblTo As MSForms.Label
+Private lblFromLocation As MSForms.Label
+Private lblToLocation As MSForms.Label
+Private lblEventHint As MSForms.Label
+Private lblModelHint As MSForms.Label
+Private lblLogoText As MSForms.Label
+Private WithEvents lblLogToggle As MSForms.Label
+
+Public NoZoom As Boolean            ' set by the self-test so the view is left alone
+
+' ---------------------------------------------------------------------------
+' Start-up and shut-down
+' ---------------------------------------------------------------------------
+Private Sub UserForm_Initialize()
+    gLrsFormOpen = True
+    mBusy = True
+    mJurIndex = -1: mRouteIndex = -1
+    mNextPick = "from"
+    mEventType = EVENT_LINEAR
+    Set mLogLines = New Collection
+    Set mService = New clsLrsService
+    Set mService.Listener = Me
+    Me.Caption = APP_TITLE & "  -  Created by " & APP_AUTHOR & "  -  Build " & BUILD_DATE
+    BuildLayout
+    FillFixedLists
+    LoadModelState
+    ApplyTheme
+    SetLogOpen Setting("log_open", "1") <> "0"
+    MeasuresEdited
+    mBusy = False
+End Sub
+
+Private Sub UserForm_Activate()
+    If mConnected Then Exit Sub
+    mConnected = True
+    RunAction "connect"
+End Sub
+
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    If mLoading Then
+        ' A request is running further up the call stack: stop it and close when it returns.
+        Cancel = True
+        mCloseRequested = True
+        mService.Cancelled = True
+        Exit Sub
+    End If
+    gLrsFormOpen = False
+    On Error Resume Next
+    If gLrsToolActive Then CommandState.StartDefaultCommand
+End Sub
+
+Private Sub cmdClose_Click()
+    Unload Me
+End Sub
+
+Private Function Setting(ByVal key As String, ByVal fallback As String) As String
+    Setting = GetSetting("VDOT LRS", "Event to Alignment", key, fallback)
+End Function
+
+Private Sub Remember(ByVal key As String, ByVal value As String)
+    SaveSetting "VDOT LRS", "Event to Alignment", key, value
+End Sub
+
+' ---------------------------------------------------------------------------
+' Layout
+' ---------------------------------------------------------------------------
+Private Function AddLabel(ByVal text As String, ByVal x As Single, ByVal y As Single, ByVal w As Single, _
+                          ByVal h As Single, ByVal role As String, Optional ByVal size As Single = 8, _
+                          Optional ByVal bold As Boolean = False) As MSForms.Label
+    Dim item As MSForms.Label
+    Set item = Me.Controls.Add("Forms.Label.1")
+    With item
+        .Caption = text
+        .Left = x: .Top = y: .Width = w: .Height = h
+        .Tag = role
+        .Font.Name = "Segoe UI": .Font.size = size
+        .Font.bold = bold
+        If Not bold Then .Font.Weight = 400
+        .WordWrap = False
+        .BackStyle = fmBackStyleTransparent
+    End With
+    Set AddLabel = item
+End Function
+
+Private Sub AddCard(ByVal y As Single, ByVal h As Single, ByVal title As String)
+    Dim card As MSForms.Label
+    Set card = AddLabel("", 12, y, FORM_WIDTH - 24, h, "card")
+    card.BackStyle = fmBackStyleOpaque
+    card.BorderStyle = fmBorderStyleSingle
+    card.ZOrder fmZOrderBack                    ' behind the drop-downs and buttons
+    AddLabel UCase$(title), 24, y + 6, 200, 10, "cardtitle", 7, True
+End Sub
+
+Private Sub Place(ByVal item As MSForms.Control, ByVal x As Single, ByVal y As Single, ByVal w As Single, _
+                  ByVal h As Single, ByVal role As String)
+    item.Left = x: item.Top = y: item.Width = w: item.Height = h
+    item.Tag = role
+End Sub
+
+Private Sub StyleCombo(ByVal combo As MSForms.ComboBox, ByVal searchable As Boolean, ByVal editable As Boolean)
+    With combo
+        .Font.Name = "Segoe UI": .Font.size = 9
+        .SpecialEffect = fmSpecialEffectFlat
+        .BorderStyle = fmBorderStyleSingle
+        .ListRows = 18
+        .MatchEntry = fmMatchEntryNone
+        If searchable Then
+            .Style = fmStyleDropDownCombo
+            .ColumnCount = 2                    ' column 1 = text shown, column 2 = hidden id
+            .ColumnWidths = ";0 pt"
+        ElseIf editable Then
+            .Style = fmStyleDropDownCombo
+        Else
+            .Style = fmStyleDropDownList
+        End If
+    End With
+End Sub
+
+Private Sub StyleButton(ByVal button As MSForms.CommandButton, ByVal caption As String, _
+                        Optional ByVal size As Single = 9, Optional ByVal face As String = "Segoe UI")
+    button.Caption = caption
+    button.Font.Name = face: button.Font.size = size
+    ' The small buttons and the Linear / Point toggle leave the focus where it was.
+    If button.Tag = "mini" Or button.Tag = "seg" Then button.TakeFocusOnClick = False
+End Sub
+
+Private Sub BuildLayout()
+    Dim dot As String, logoPath As String, y As Single
+    dot = "  " & ChrW$(183) & "  "
+    Me.Width = FORM_WIDTH + (Me.Width - Me.InsideWidth)
+    Me.Height = BUTTONS_TOP + 32 + (Me.Height - Me.InsideHeight)
+
+    ' Cards first, so everything added later sits on top of them.
+    AddCard 58, 102, "Route"
+    AddCard 166, 110, "Event"
+    AddCard 282, 124, "Drawing"
+
+    ' Header
+    Set lblLogoText = AddLabel("VDOT", 12, 10, 104, 32, "logo", 14, True)
+    lblLogoText.BackStyle = fmBackStyleOpaque
+    lblLogoText.TextAlign = fmTextAlignCenter
+    lblLogoText.ZOrder fmZOrderBack             ' the logo image sits on this white chip
+    Place imgLogo, 20, 14, 88, 24, "image"
+    imgLogo.BorderStyle = fmBorderStyleNone
+    imgLogo.BackStyle = fmBackStyleTransparent
+    imgLogo.PictureSizeMode = fmPictureSizeModeZoom
+    logoPath = LogoFile()
+    On Error Resume Next
+    If logoPath <> "" Then imgLogo.Picture = LoadPicture(logoPath)
+    If logoPath = "" Or Err.Number <> 0 Then
+        imgLogo.Visible = False                 ' the "VDOT" text badge shows instead
+    Else
+        lblLogoText.Caption = ""
+    End If
+    On Error GoTo 0
+
+    AddLabel "LRS Event " & ChrW$(&H2192) & " Alignment", 126, 6, 170, 20, "title", 14, True
+    AddLabel "VDOT LRS Route Master" & dot & "MicroStation", 126, 27, 170, 11, "muted"
+    AddLabel "Created by " & APP_AUTHOR & dot & "Build " & BUILD_DATE, 126, 38, 170, 11, "muted"
+    Set lblStatus = AddLabel("CONNECTING", 300, 9, 78, 13, "status", 7, True)
+    lblStatus.BackStyle = fmBackStyleOpaque
+    lblStatus.TextAlign = fmTextAlignCenter
+    SetStatus "CONNECTING", "#22d3ee", "#0f172a"
+    Place cboTheme, 300, 27, 78, 18, "input"
+    StyleCombo cboTheme, False, False
+
+    ' Route card
+    y = 58
+    AddLabel "Jurisdiction", 24, y + 19, 150, 10, "muted"
+    Place cboJurisdiction, 24, y + 30, 342, 18, "input"
+    StyleCombo cboJurisdiction, True, False
+    AddLabel "Route", 24, y + 55, 150, 10, "muted"
+    Place cmdOpposite, 256, y + 49, 110, 16, "mini"
+    StyleButton cmdOpposite, ChrW$(&H21C4) & "  Opposite direction", 8, "Segoe UI Symbol"
+    Place cboRoute, 24, y + 66, 342, 18, "input"
+    StyleCombo cboRoute, True, False
+    Set lblRouteHint = AddLabel("", 24, y + 87, 342, 11, "muted")
+
+    ' Event card
+    y = 166
+    AddLabel "Type", 24, y + 23, 40, 10, "muted"
+    Place cmdLinear, 70, y + 19, 55, 18, "seg"
+    StyleButton cmdLinear, EVENT_LINEAR
+    Place cmdPoint, 125, y + 19, 55, 18, "seg"
+    StyleButton cmdPoint, EVENT_POINT
+    Place cmdFull, 310, y + 20, 56, 16, "mini"
+    StyleButton cmdFull, "Full route", 8
+    cmdFull.ControlTipText = "Set From and To to the start and end of the route"
+    AddLabel "Measure (mi)", 70, y + 40, 110, 10, "muted"
+    AddLabel "Latitude, longitude", 192, y + 40, 150, 10, "muted"
+    Set lblFrom = AddLabel("", 18, y + 54, 50, 12, "pinfrom", 9, True)
+    Place cboFrom, 70, y + 51, 110, 18, "input"
+    StyleCombo cboFrom, False, True
+    Set lblFromLocation = AddLabel("", 192, y + 54, 146, 11, "value", 9)
+    lblFromLocation.Font.Name = "Consolas"
+    Set lblTo = AddLabel("", 18, y + 76, 50, 12, "pinto", 9, True)
+    Place cboTo, 70, y + 73, 110, 18, "input"
+    StyleCombo cboTo, False, True
+    Set lblToLocation = AddLabel("", 192, y + 76, 146, 11, "value", 9)
+    lblToLocation.Font.Name = "Consolas"
+    Place cmdSwap, 344, y + 60, 22, 22, "mini"
+    StyleButton cmdSwap, ChrW$(&H21C5), 10, "Segoe UI Symbol"
+    cmdSwap.ControlTipText = "Swap the From and To measures"
+    Set lblEventHint = AddLabel("", 24, y + 95, 342, 11, "muted")
+
+    ' Drawing card
+    y = 282
+    AddLabel "Coordinate system", 24, y + 19, 150, 10, "muted"
+    Place cboCoords, 24, y + 30, 342, 18, "input"
+    StyleCombo cboCoords, False, False
+    AddLabel "Labels", 24, y + 51, 150, 10, "muted"
+    AddLabel "Milepost signs", 198, y + 51, 150, 10, "muted"
+    Place cboLabels, 24, y + 62, 168, 18, "input"
+    StyleCombo cboLabels, False, False
+    Place cboMileposts, 198, y + 62, 168, 18, "input"
+    StyleCombo cboMileposts, False, False
+    Set lblModelHint = AddLabel("", 24, y + 83, 342, 11, "muted")
+    Place cmdPick, 24, y + 98, 204, 20, "ghost"
+    StyleButton cmdPick, "Pick From / To in drawing"
+    Place cmdZoom, 234, y + 98, 132, 20, "ghost"
+    StyleButton cmdZoom, "Zoom to route"
+
+    ' Log and buttons
+    Set lblLogToggle = AddLabel("LOG", 14, LOG_TOP - 12, 60, 10, "muted", 7, True)
+    lblLogToggle.MousePointer = fmMousePointerUpArrow
+    Place fraLog, 12, LOG_TOP, FORM_WIDTH - 24, LOG_HEIGHT, "log"
+    With fraLog
+        .Caption = ""
+        .SpecialEffect = fmSpecialEffectFlat
+        .BorderStyle = fmBorderStyleSingle
+        .ScrollBars = fmScrollBarsVertical
+        .KeepScrollBarsVisible = fmScrollBarsNone
+    End With
+    Place cmdClose, 216, BUTTONS_TOP, 56, 24, "ghostbg"
+    StyleButton cmdClose, "Close"
+    Place cmdCreate, 278, BUTTONS_TOP, 100, 24, "primary"
+    StyleButton cmdCreate, "Create alignment"
+    cmdCreate.Font.bold = True
+    Place cmdDelete, 12, BUTTONS_TOP, 86, 24, "danger"
+    StyleButton cmdDelete, "Delete created"
+    cmdDelete.ControlTipText = "Delete every event, marker, label and milepost sign this tool placed in the active model"
+
+    ' "Draw it?" bar shown after the last pick, above the buttons
+    Set lblOffer = AddLabel("", 12, BUTTONS_TOP, FORM_WIDTH - 24, OFFER_HEIGHT - 4, "offer", 9, True)
+    lblOffer.BackStyle = fmBackStyleOpaque
+    lblOffer.BorderStyle = fmBorderStyleSingle
+    lblOffer.WordWrap = True
+    Place cmdOfferNo, 262, BUTTONS_TOP, 40, 20, "ghost"
+    StyleButton cmdOfferNo, "No"
+    Place cmdOfferYes, 306, BUTTONS_TOP, 66, 20, "primary"
+    StyleButton cmdOfferYes, "Yes, draw it"
+    cmdOfferYes.Font.bold = True
+    lblOffer.ZOrder fmZOrderBack
+    ShowOfferBar False
+End Sub
+
+Private Sub ShowOfferBar(ByVal visible As Boolean)
+    mOfferOpen = visible
+    lblOffer.Visible = visible: cmdOfferYes.Visible = visible: cmdOfferNo.Visible = visible
+    LayoutBottom
+End Sub
+
+Private Sub LayoutBottom()
+    ' Places the "Draw it?" bar (when shown) and the button row below the log.
+    Dim rowTop As Single
+    rowTop = IIf(mLogOpen, BUTTONS_TOP, LOG_TOP + 2)
+    If mOfferOpen Then
+        lblOffer.Top = rowTop
+        cmdOfferNo.Top = rowTop + 3: cmdOfferYes.Top = rowTop + 3
+        rowTop = rowTop + OFFER_HEIGHT
+    End If
+    cmdClose.Top = rowTop: cmdCreate.Top = rowTop: cmdDelete.Top = rowTop
+    Me.Height = rowTop + 32 + (Me.Height - Me.InsideHeight)
+End Sub
+
+Private Sub SelectSaved(ByVal combo As MSForms.ComboBox, ByVal key As String, ParamArray values() As Variant)
+    ' Selects the entry whose value was saved under key (the first entry when none was).
+    Dim saved As String, i As Long
+    combo.ListIndex = 0
+    saved = Setting(key, "")
+    For i = LBound(values) To UBound(values)
+        If saved <> "" And CStr(values(i)) = saved Then combo.ListIndex = i
+    Next i
+End Sub
+
+Private Sub FillFixedLists()
+    cboLabels.AddItem "Measures and route name"
+    cboLabels.AddItem "Measures only"
+    cboLabels.AddItem "No labels"
+    SelectSaved cboLabels, "labels", LABELS_ALL, LABELS_MEASURES, LABELS_NONE
+    cboMileposts.AddItem "No milepost signs"
+    cboMileposts.AddItem "At From and To"
+    cboMileposts.AddItem "Every mile"
+    cboMileposts.AddItem "Every 0.5 mile"
+    cboMileposts.AddItem "Every 0.1 mile"
+    SelectSaved cboMileposts, "mileposts", MILEPOST_NONE, MILEPOST_ENDS, "1", "0.5", "0.1"
+    cboTheme.AddItem "Dark"
+    cboTheme.AddItem "Light"
+    If Setting("theme", "Dark") = "Light" Then cboTheme.ListIndex = 1 Else cboTheme.ListIndex = 0
+End Sub
+
+Private Function LabelsMode() As String
+    LabelsMode = Choose(cboLabels.ListIndex + 1, LABELS_ALL, LABELS_MEASURES, LABELS_NONE)
+End Function
+
+Private Function MilepostMode() As String
+    MilepostMode = Choose(cboMileposts.ListIndex + 1, MILEPOST_NONE, MILEPOST_ENDS, "1", "0.5", "0.1")
+End Function
+
+Private Sub cboLabels_Change()
+    If Not mBusy Then Remember "labels", LabelsMode()
+End Sub
+
+Private Sub cboMileposts_Change()
+    If Not mBusy Then Remember "mileposts", MilepostMode()
+End Sub
+
+Private Function CoordKey(ByVal index As Long) As String
+    CoordKey = mCoordModes(index) & ":" & mCoordCodes(index)
+End Function
+
+Private Sub LoadModelState()
+    Dim gcsName As String, hint As String, n As Long, i As Long, dot As String, saved As String
+    dot = "  " & ChrW$(183) & "  "
+    On Error Resume Next
+    gcsName = ModelGcsName()
+    hint = "Active model: " & IIf(Model3D(), "3D", "2D - elements will be 2D") & dot & _
+           IIf(gcsName <> "", "GCS: " & gcsName, "no GCS assigned")
+    If Err.Number <> 0 Then hint = Err.Description
+    On Error GoTo 0
+    ReDim mCoordModes(0 To EpsgCount() + 1), mCoordCodes(0 To EpsgCount() + 1)
+    If gcsName <> "" Then
+        cboCoords.AddItem "Model GCS  (" & gcsName & ")"
+        mCoordModes(n) = MODE_MODEL_GCS: n = n + 1
+    End If
+    For i = 0 To EpsgCount() - 1
+        cboCoords.AddItem "EPSG:" & EpsgCode(i) & "  " & EpsgName(i)
+        mCoordModes(n) = MODE_EPSG: mCoordCodes(n) = EpsgCode(i): n = n + 1
+    Next i
+    cboCoords.AddItem "Local tangent plane (no GCS)"
+    mCoordModes(n) = MODE_LOCAL
+    cboCoords.ListIndex = 0
+    saved = Setting("coordinates", "")
+    For i = 1 To n
+        If saved <> "" And CoordKey(i) = saved Then
+            cboCoords.ListIndex = i
+            Log "Coordinate system from your last session: " & cboCoords.text & "."
+        End If
+    Next i
+    lblModelHint.Caption = hint
+    cmdPick.Enabled = False: cmdZoom.Enabled = False: cmdCreate.Enabled = False
+    cmdSwap.Enabled = False: cmdFull.Enabled = False
+End Sub
+
+' ---------------------------------------------------------------------------
+' Themes
+' ---------------------------------------------------------------------------
+Private Function Pal(ByVal key As String) As Long
+    Dim dark As Boolean, hexText As String
+    dark = (cboTheme.ListIndex <> 1)
+    Select Case key
+        Case "BG": hexText = IIf(dark, "#0f172a", "#f1f5f9")
+        Case "TEXT": hexText = IIf(dark, "#e2e8f0", "#0f172a")
+        Case "CARD": hexText = IIf(dark, "#1e293b", "#ffffff")
+        Case "CARD_BORDER": hexText = IIf(dark, "#2c3a52", "#cbd5e1")
+        Case "TITLE": hexText = IIf(dark, "#f8fafc", "#003a70")
+        Case "MUTED": hexText = IIf(dark, "#94a3b8", "#475569")
+        Case "VALUE": hexText = IIf(dark, "#cbd5e1", "#1e293b")
+        Case "ACCENT": hexText = IIf(dark, "#f97316", "#ea580c")
+        Case "ON_ACCENT": hexText = IIf(dark, "#0f172a", "#ffffff")
+        Case "PIN_FROM": hexText = IIf(dark, "#4ade80", "#16a34a")
+        Case "PIN_TO": hexText = IIf(dark, "#f87171", "#dc2626")
+        Case "PIN_FROM_BG": hexText = IIf(dark, "#14532d", "#dcfce7")
+        Case "PIN_TO_BG": hexText = IIf(dark, "#7f1d1d", "#fee2e2")
+        Case "INPUT_BG": hexText = IIf(dark, "#0f172a", "#f8fafc")
+        Case "INPUT_BORDER": hexText = IIf(dark, "#334155", "#cbd5e1")
+        Case "LOG_BG": hexText = IIf(dark, "#0b1220", "#f8fafc")
+        Case "GHOST_TEXT": hexText = IIf(dark, "#cbd5e1", "#334155")
+        Case "CARD_TITLE": hexText = IIf(dark, "#f97316", "#ea580c")
+        Case "PICK_BG": hexText = IIf(dark, "#0e3a4a", "#ecfeff")
+        Case "DISABLED_TEXT": hexText = IIf(dark, "#64748b", "#94a3b8")
+        Case "LOG_ERROR": hexText = IIf(dark, "#f87171", "#dc2626")
+        Case "LOG_WARN": hexText = IIf(dark, "#fbbf24", "#b45309")
+        Case "LOG_OK": hexText = IIf(dark, "#4ade80", "#15803d")
+        Case Else: hexText = "#ff00ff"
+    End Select
+    Pal = HexColor(hexText)
+End Function
+
+Private Sub ApplyTheme()
+    Dim item As Object              ' late bound: colours are not on MSForms.Control
+    Me.BackColor = Pal("BG")
+    For Each item In Me.Controls
+        Select Case item.Tag
+            Case "card": item.BackColor = Pal("CARD"): item.BorderColor = Pal("CARD_BORDER")
+            Case "offer": item.BackColor = Pal("PICK_BG"): item.BorderColor = Pal("TITLE"): item.ForeColor = Pal("TITLE")
+            Case "title": item.ForeColor = Pal("TITLE")
+            Case "muted": item.ForeColor = Pal("MUTED")
+            Case "hinterror": item.ForeColor = Pal("LOG_ERROR")
+            Case "cardtitle": item.ForeColor = Pal("CARD_TITLE")
+            Case "value": item.ForeColor = Pal("VALUE")
+            Case "pinfrom": item.ForeColor = Pal("PIN_FROM")
+            Case "pinto": item.ForeColor = Pal("PIN_TO")
+            Case "logo": item.BackColor = vbWhite: item.ForeColor = HexColor("#003a70")
+            Case "input"
+                item.BackColor = Pal("INPUT_BG"): item.ForeColor = Pal("TEXT")
+                item.BorderColor = Pal("INPUT_BORDER")
+            Case "log": item.BackColor = Pal("LOG_BG"): item.BorderColor = Pal("CARD_BORDER")
+            Case "logline": item.ForeColor = Pal("VALUE")
+            Case "logerror": item.ForeColor = Pal("LOG_ERROR")
+            Case "logwarn": item.ForeColor = Pal("LOG_WARN")
+            Case "logok": item.ForeColor = Pal("LOG_OK")
+            Case "primary": item.BackColor = Pal("ACCENT"): item.ForeColor = Pal("ON_ACCENT")
+            Case "ghost", "mini": item.BackColor = Pal("CARD"): item.ForeColor = Pal("GHOST_TEXT")
+            Case "ghostbg": item.BackColor = Pal("BG"): item.ForeColor = Pal("GHOST_TEXT")
+            Case "danger": item.BackColor = Pal("BG"): item.ForeColor = Pal("LOG_ERROR")
+        End Select
+    Next item
+    SyncEventType
+    SyncPickState
+    SyncOpposite
+    Remember "theme", cboTheme.text
+End Sub
+
+Private Sub cboTheme_Change()
+    If mBusy Then Exit Sub
+    ApplyTheme
+End Sub
+
+Private Sub SetStatus(ByVal text As String, ByVal backHex As String, ByVal foreHex As String)
+    lblStatus.Caption = text
+    lblStatus.BackColor = HexColor(backHex)
+    lblStatus.ForeColor = HexColor(foreHex)
+End Sub
+
+Private Sub SetEventHint(ByVal text As String, Optional ByVal isError As Boolean = False)
+    lblEventHint.Caption = text
+    lblEventHint.Tag = IIf(isError, "hinterror", "muted")
+    lblEventHint.ForeColor = Pal(IIf(isError, "LOG_ERROR", "MUTED"))
+End Sub
+
+' ---------------------------------------------------------------------------
+' Log, errors
+' ---------------------------------------------------------------------------
+Private Function LogRole(ByVal message As String) As String
+    LogRole = "logline"
+    If Left$(message, 5) = "ERROR" Then LogRole = "logerror"
+    If Left$(message, 7) = "WARNING" Then LogRole = "logwarn"
+    If Left$(message, 7) = "SUCCESS" Then LogRole = "logok"
+End Function
+
+Private Function LogColor(ByVal role As String) As Long
+    Select Case role
+        Case "logerror": LogColor = Pal("LOG_ERROR")
+        Case "logwarn": LogColor = Pal("LOG_WARN")
+        Case "logok": LogColor = Pal("LOG_OK")
+        Case Else: LogColor = Pal("VALUE")
+    End Select
+End Function
+
+Public Sub Log(ByVal message As String)
+    ' Each line is a label in the log frame, so errors, warnings and successes get a colour.
+    Dim item As MSForms.Label, lineWidth As Single, i As Long
+    If mLogText = "" Then mLogText = message Else mLogText = mLogText & vbCrLf & message
+    Debug.Print "[LRS] " & message
+    If mLogLines.count >= MAX_LOG_LINES Then
+        For i = 1 To MAX_LOG_LINES \ 3                 ' drop the oldest third and close the gap
+            fraLog.Controls.Remove mLogLines(1).Name
+            mLogLines.Remove 1
+        Next i
+        mLogBottom = 2
+        For i = 1 To mLogLines.count
+            mLogLines(i).Top = mLogBottom
+            mLogBottom = mLogBottom + mLogLines(i).Height
+        Next i
+    End If
+    If mLogBottom < 2 Then mLogBottom = 2
+    lineWidth = fraLog.Width - 22
+    Set item = fraLog.Controls.Add("Forms.Label.1")
+    With item
+        .Tag = LogRole(message)
+        .Font.Name = "Consolas": .Font.size = 8: .Font.Weight = 400
+        .BackStyle = fmBackStyleTransparent
+        .ForeColor = LogColor(.Tag)
+        .Left = 4: .Top = mLogBottom
+        .WordWrap = True
+        .Width = lineWidth
+        .Caption = message
+        .AutoSize = True                        ' with the width set first, this fits the height
+        .AutoSize = False
+        .Width = lineWidth
+        mLogBottom = .Top + .Height
+    End With
+    mLogLines.Add item
+    fraLog.ScrollHeight = mLogBottom + 2
+    If mLogBottom + 2 > fraLog.InsideHeight Then fraLog.ScrollTop = mLogBottom + 2 - fraLog.InsideHeight
+End Sub
+
+Private Sub SetLogOpen(ByVal isOpen As Boolean)
+    mLogOpen = isOpen
+    fraLog.Visible = isOpen
+    lblLogToggle.Caption = "LOG  " & ChrW$(IIf(isOpen, &H25BE, &H25B8))
+    LayoutBottom
+    Remember "log_open", IIf(isOpen, "1", "0")
+End Sub
+
+Private Sub lblLogToggle_Click()
+    SetLogOpen Not mLogOpen
+End Sub
+
+Public Sub OnServiceRetry(ByVal attempt As Long)
+    Log "The VDOT LRS service did not answer - retrying (" & attempt & " of 2)."
+End Sub
+
+Public Sub OnServiceWaiting()
+    ' Called by the service while a request runs: animates the status badge.
+    If mStatusText = "" Or Abs(Timer - mStatusTick) < 0.35 Then Exit Sub
+    mStatusTick = Timer
+    mStatusStep = (mStatusStep + 1) Mod 4
+    lblStatus.Caption = mStatusText & String$(mStatusStep, ".")
+End Sub
+
+Private Sub RunAction(ByVal action As String)
+    ' Runs a UI action and reports failures in the log instead of stopping the macro.
+    Dim number As Long, description As String, loads As Boolean, offline As Boolean
+    loads = (action = "connect" Or action = "routes" Or action = "route" Or action = "opposite")
+    If loads Then
+        If mLoading Then Exit Sub               ' one request at a time
+        mLoading = True
+        mService.Cancelled = False
+        mStatusText = IIf(action = "connect", "CONNECTING", "LOADING")
+        mStatusStep = 0: mStatusTick = Timer
+        SetStatus mStatusText, "#22d3ee", "#0f172a"
+    End If
+    On Error GoTo Failed
+    Me.MousePointer = fmMousePointerHourGlass
+    Select Case action
+        Case "connect": DoConnect
+        Case "routes": LoadRoutes
+        Case "route": LoadRoute
+        Case "opposite": SwitchOpposite
+        Case "measures": MeasuresEdited
+        Case "swap": SwapMeasures
+        Case "full": FullRoute
+        Case "reproject": Reproject
+        Case "pick": TogglePickTool
+        Case "zoom": ZoomRoute
+        Case "create": CreateEvent
+        Case "delete": DeleteCreated True
+        Case "deletetest": DeleteCreated False
+    End Select
+Done:
+    On Error Resume Next
+    If loads Then
+        mLoading = False
+        mStatusText = ""
+        If Not offline Then SetStatus "CONNECTED", "#4ade80", "#052e16"
+        SyncOpposite
+    End If
+    Me.MousePointer = fmMousePointerDefault
+    If mCloseRequested And Not mLoading Then Unload Me
+    Exit Sub
+Failed:
+    number = Err.number: description = Err.description
+    If number = ERR_CANCELLED Then Resume Done
+    Log "ERROR: " & description
+    If number = ERR_SERVICE Then
+        offline = True
+        SetStatus "OFFLINE", "#dc2626", "#ffffff"
+        If mRoute Is Nothing Then lblRouteHint.Caption = "The service could not be reached. Choose again to retry."
+    ElseIf number <> ERR_INPUT And number <> ERR_DATA Then
+        ShowMessage "VDOT LRS tool error.", description, msdMessageCenterPriorityError, False
+    End If
+    Resume Done
+End Sub
+
+' ---------------------------------------------------------------------------
+' Searchable drop-downs (Jurisdiction and Route)
+' ---------------------------------------------------------------------------
+Private Sub SetList(ByVal combo As MSForms.ComboBox, names() As String, ids() As String, ByVal count As Long, _
+                    Optional ByVal needle As String = "")
+    ' Fills a two-column list with the entries whose name contains needle (all when "").
+    Dim rows() As Variant, i As Long, n As Long, lower() As String
+    If count = 0 Then
+        combo.Clear
+        Exit Sub
+    End If
+    If needle = "" Then
+        ReDim rows(0 To count - 1, 0 To 1)
+        For i = 0 To count - 1
+            rows(i, 0) = names(i): rows(i, 1) = ids(i)
+        Next i
+        combo.List = rows
+        Exit Sub
+    End If
+    If combo Is cboJurisdiction Then lower = mJurLower Else lower = mRouteLower
+    For i = 0 To count - 1
+        If InStr(lower(i), needle) > 0 Then n = n + 1
+    Next i
+    If n = 0 Then
+        combo.Clear
+        Exit Sub
+    End If
+    ReDim rows(0 To n - 1, 0 To 1)
+    n = 0
+    For i = 0 To count - 1
+        If InStr(lower(i), needle) > 0 Then
+            rows(n, 0) = names(i): rows(n, 1) = ids(i): n = n + 1
+        End If
+    Next i
+    combo.List = rows
+End Sub
+
+Private Sub ShowSelection(ByVal combo As MSForms.ComboBox)
+    ' Shows the full list again with the current selection (or blank).
+    Dim wasBusy As Boolean
+    wasBusy = mBusy
+    mBusy = True
+    If combo Is cboJurisdiction Then
+        SetList combo, mJurNames, mJurValues, mJurCount
+        If mJurIndex >= 0 Then combo.ListIndex = mJurIndex Else combo.text = ""
+    Else
+        SetList combo, mRouteNames, mRouteIds, mRouteCount
+        If mRouteIndex >= 0 Then combo.ListIndex = mRouteIndex Else combo.text = ""
+    End If
+    mBusy = wasBusy
+End Sub
+
+Private Sub FilterList(ByVal combo As MSForms.ComboBox)
+    ' Narrows the list to the entries containing what has been typed.
+    Dim typed As String
+    typed = combo.text
+    mBusy = True
+    If combo Is cboJurisdiction Then
+        SetList combo, mJurNames, mJurValues, mJurCount, LCase$(typed)
+    Else
+        SetList combo, mRouteNames, mRouteIds, mRouteCount, LCase$(typed)
+    End If
+    combo.text = typed
+    combo.SelStart = Len(typed)
+    mBusy = False
+    If combo.ListCount > 0 And typed <> "" Then combo.DropDown
+End Sub
+
+Private Function FullIndex(ByVal combo As MSForms.ComboBox, ByVal fromTyping As Boolean) As Long
+    ' Index in the full list of the highlighted row, or of the typed name (any case); -1 if none.
+    Dim i As Long, wanted As String
+    FullIndex = -1
+    If combo.ListIndex >= 0 Then
+        wanted = combo.List(combo.ListIndex, 1)
+        If combo Is cboJurisdiction Then
+            For i = 0 To mJurCount - 1
+                If mJurValues(i) = wanted Then FullIndex = i: Exit Function
+            Next i
+        Else
+            For i = 0 To mRouteCount - 1
+                If mRouteIds(i) = wanted Then FullIndex = i: Exit Function
+            Next i
+        End If
+    ElseIf fromTyping And Trim$(combo.text) <> "" Then
+        wanted = LCase$(Trim$(combo.text))
+        If combo Is cboJurisdiction Then
+            For i = 0 To mJurCount - 1
+                If mJurLower(i) = wanted Then FullIndex = i: Exit Function
+            Next i
+        Else
+            For i = 0 To mRouteCount - 1
+                If mRouteLower(i) = wanted Then FullIndex = i: Exit Function
+            Next i
+        End If
+    End If
+End Function
+
+Private Sub CommitSearch(ByVal combo As MSForms.ComboBox, ByVal fromTyping As Boolean, ByVal onlyIfChanged As Boolean)
+    Dim index As Long
+    index = FullIndex(combo, fromTyping)
+    If index < 0 Or mLoading Then               ' a choice made during a request is not taken
+        ShowSelection combo
+        Exit Sub
+    End If
+    If combo Is cboJurisdiction Then
+        If onlyIfChanged And index = mJurIndex Then ShowSelection combo: Exit Sub
+        mJurIndex = index
+        ShowSelection combo
+        RunAction "routes"
+    Else
+        If onlyIfChanged And index = mRouteIndex Then ShowSelection combo: Exit Sub
+        mRouteIndex = index
+        ShowSelection combo
+        RunAction "route"
+    End If
+End Sub
+
+Private Sub SearchKeyDown(ByVal combo As MSForms.ComboBox, ByVal KeyCode As MSForms.ReturnInteger)
+    mKeyHeld = True
+    Select Case KeyCode.value
+        Case vbKeyUp, vbKeyDown, vbKeyPageUp, vbKeyPageDown
+            mKeyNav = True
+        Case vbKeyReturn
+            mKeyHeld = False: mKeyNav = False
+            KeyCode.value = 0
+            CommitSearch combo, True, False
+        Case vbKeyEscape
+            mKeyHeld = False: mKeyNav = False
+            ShowSelection combo
+        Case Else
+            mKeyNav = False
+    End Select
+End Sub
+
+Private Sub SearchChange(ByVal combo As MSForms.ComboBox)
+    If mBusy Then Exit Sub
+    If mKeyHeld Then
+        If Not mKeyNav Then FilterList combo           ' typing
+    ElseIf combo.ListIndex >= 0 Then
+        CommitSearch combo, False, False                ' a row was clicked
+    End If
+End Sub
+
+Private Sub SearchExit(ByVal combo As MSForms.ComboBox)
+    mKeyHeld = False: mKeyNav = False
+    If mBusy Then Exit Sub
+    CommitSearch combo, False, True                     ' leftover typing just restores the box
+End Sub
+
+Private Sub cboJurisdiction_KeyDown(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    SearchKeyDown cboJurisdiction, KeyCode
+End Sub
+
+Private Sub cboJurisdiction_KeyUp(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    mKeyHeld = False
+End Sub
+
+Private Sub cboJurisdiction_Change()
+    SearchChange cboJurisdiction
+End Sub
+
+Private Sub cboJurisdiction_Exit(ByVal Cancel As MSForms.ReturnBoolean)
+    SearchExit cboJurisdiction
+End Sub
+
+Private Sub cboRoute_KeyDown(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    SearchKeyDown cboRoute, KeyCode
+End Sub
+
+Private Sub cboRoute_KeyUp(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    mKeyHeld = False
+End Sub
+
+Private Sub cboRoute_Change()
+    SearchChange cboRoute
+End Sub
+
+Private Sub cboRoute_Exit(ByVal Cancel As MSForms.ReturnBoolean)
+    SearchExit cboRoute
+End Sub
+
+' ---------------------------------------------------------------------------
+' Service chain: jurisdictions -> routes -> route
+' ---------------------------------------------------------------------------
+Private Sub DoConnect()
+    Dim names() As String, i As Long, saved As String
+    mJurCount = mService.Jurisdictions(names)
+    Log "Connected to VDOT LRS Route Master: " & mJurCount & " jurisdictions."
+    If mJurCount = 0 Then Exit Sub
+    ReDim mJurNames(0 To mJurCount - 1), mJurLower(0 To mJurCount - 1), mJurValues(0 To mJurCount - 1)
+    For i = 0 To mJurCount - 1
+        mJurValues(i) = names(i)
+        If names(i) = "" Then mJurNames(i) = STATEWIDE_LABEL Else mJurNames(i) = names(i)
+        mJurLower(i) = LCase$(mJurNames(i))
+    Next i
+    mJurIndex = -1
+    If Setting("jurisdiction_saved", "0") = "1" Then        ' the jurisdiction used last time
+        saved = Setting("jurisdiction", "")
+        For i = 0 To mJurCount - 1
+            If mJurValues(i) = saved Then mJurIndex = i
+        Next i
+    End If
+    ShowSelection cboJurisdiction
+    If mJurIndex >= 0 Then
+        LoadRoutes
+    Else
+        lblRouteHint.Caption = "Choose a jurisdiction."
+    End If
+End Sub
+
+Private Sub LoadRoutes()
+    Dim statewide As Long, i As Long, jurisdictionName As String
+    ClearRoute
+    mRouteCount = 0: mRouteIndex = -1
+    ShowSelection cboRoute
+    If mJurIndex < 0 Then Exit Sub
+    jurisdictionName = mJurValues(mJurIndex)
+    lblRouteHint.Caption = "Loading routes" & ChrW$(&H2026)
+    mService.Routes jurisdictionName, mRouteNames, mRouteIds, mRouteCount, statewide
+    Remember "jurisdiction", jurisdictionName
+    Remember "jurisdiction_saved", "1"
+    If jurisdictionName <> "" Then
+        Log mRouteCount & " route(s) for " & jurisdictionName & ": " & statewide & _
+            " statewide (Interstate, US, VA, ramps) crossing it, listed first, and " & _
+            (mRouteCount - statewide) & " of its own."
+    Else
+        Log mRouteCount & " statewide route(s), Interstate, US and VA first."
+    End If
+    If mRouteCount > 0 Then
+        ReDim mRouteLower(0 To mRouteCount - 1)
+        For i = 0 To mRouteCount - 1
+            mRouteLower(i) = LCase$(mRouteNames(i))
+        Next i
+    End If
+    ShowSelection cboRoute
+    lblRouteHint.Caption = "Choose a route."
+End Sub
+
+Private Sub ClearRoute()
+    Set mRoute = Nothing
+    Set mShape = Nothing
+    Erase mRoutePreview: mRoutePreviewCount = 0
+    Erase mEventPreview: mEventPreviewCount = 0
+    mLastEventKey = ""
+    lblRouteHint.Caption = ""
+    SetEventHint ""
+    lblFromLocation.Caption = ""
+    lblToLocation.Caption = ""
+    mBusy = True
+    cboFrom.Clear: cboTo.Clear
+    mBusy = False
+    mLastFromText = "": mLastToText = ""
+    cmdPick.Enabled = False: cmdZoom.Enabled = False: cmdCreate.Enabled = False
+    cmdSwap.Enabled = False: cmdFull.Enabled = False
+    SyncOpposite
+End Sub
+
+Private Function RouteHasOpposite() As Boolean
+    If Not mRoute Is Nothing Then RouteHasOpposite = mRoute.OppositeExists
+End Function
+
+Private Sub SyncOpposite()
+    ' The button is dimmed rather than disabled when the route has no opposite direction:
+    ' a disabled button draws its caption embossed, which is unreadable on the dark theme.
+    cmdOpposite.ForeColor = Pal(IIf(RouteHasOpposite(), "GHOST_TEXT", "DISABLED_TEXT"))
+    If mRoute Is Nothing Then
+        cmdOpposite.ControlTipText = ""
+    ElseIf mRoute.OppositeExists Then
+        cmdOpposite.ControlTipText = "Load " & mRoute.OppositeName
+    Else
+        cmdOpposite.ControlTipText = "The LRS has no separate route for the opposite direction of this road"
+    End If
+End Sub
+
+Private Sub LoadRoute()
+    Dim stops() As Double, n As Long, i As Long, dot As String, opposite As String, shape As clsLrsGeometry
+    ClearRoute
+    If mRouteIndex < 0 Then Exit Sub
+    dot = "  " & ChrW$(183) & "  "
+    lblRouteHint.Caption = "Loading route" & ChrW$(&H2026)
+    Set mRoute = mService.Route(mRouteIds(mRouteIndex))
+    Set shape = mRoute.Geometry
+    If mRoute.OppositeExists Then opposite = dot & "opposite " & mRoute.OppositeName
+    lblRouteHint.Caption = mRoute.NameId & dot & FmtNum(shape.MMax, 2) & " mi" & dot & _
+                           shape.PartCount & " part(s)" & opposite
+    Log "Loaded " & mRoute.CommonName & ": " & shape.VertexCount & " vertices, measures " & _
+        FmtMeasure(shape.MMin) & " to " & FmtMeasure(shape.MMax) & " mi."
+
+    n = shape.Stops(stops)
+    mBusy = True
+    For i = 0 To n - 1
+        cboFrom.AddItem FmtMeasure(stops(i))
+        cboTo.AddItem FmtMeasure(stops(i))
+    Next i
+    cboFrom.text = FmtMeasure(shape.MMin)
+    cboTo.text = FmtMeasure(shape.VM(shape.PartEnd(0)))
+    mBusy = False
+    mNextPick = "from"
+    cmdCreate.Enabled = True: cmdSwap.Enabled = True: cmdFull.Enabled = True
+    SyncOpposite
+    Reproject
+End Sub
+
+Private Sub SwitchOpposite()
+    ' Loads the opposite direction of the current route, adding it to the list if needed.
+    Dim target As String, i As Long, index As Long, other As clsLrsRoute
+    If mRoute Is Nothing Then Err.Raise ERR_INPUT, "frmLrsEvent", "Choose a route first."
+    If Not mRoute.OppositeExists Then
+        Log "The LRS has no separate route for the opposite direction of " & mRoute.RouteName & "."
+        Exit Sub
+    End If
+    target = mRoute.OppositeName
+    index = -1
+    For i = 0 To mRouteCount - 1
+        If mRouteIds(i) = target Then index = i: Exit For
+    Next i
+    If index < 0 Then
+        Set other = mService.Route(target)
+        ReDim Preserve mRouteNames(0 To mRouteCount), mRouteLower(0 To mRouteCount), mRouteIds(0 To mRouteCount)
+        mRouteNames(mRouteCount) = other.CommonName
+        mRouteLower(mRouteCount) = LCase$(other.CommonName)
+        mRouteIds(mRouteCount) = target
+        index = mRouteCount
+        mRouteCount = mRouteCount + 1
+    End If
+    mRouteIndex = index
+    ShowSelection cboRoute
+    LoadRoute
+End Sub
+
+Private Sub cmdOpposite_Click()
+    RunAction "opposite"
+End Sub
+
+' ---------------------------------------------------------------------------
+' Event
+' ---------------------------------------------------------------------------
+Private Function MeasureOf(ByVal combo As MSForms.ComboBox) As Double
+    Dim text As String, token As String, i As Long, c As String, digits As Long
+    text = Trim$(combo.text)
+    If text = "" Then Err.Raise ERR_INPUT, "frmLrsEvent", "Enter a measure."
+    token = Split(text, " ")(0)
+    For i = 1 To Len(token)
+        c = Mid$(token, i, 1)
+        If c >= "0" And c <= "9" Then
+            digits = digits + 1
+        ElseIf Not (c = "." Or ((c = "-" Or c = "+") And i = 1)) Then
+            digits = 0
+            Exit For
+        End If
+    Next i
+    If digits = 0 Then Err.Raise ERR_INPUT, "frmLrsEvent", "'" & text & "' is not a measure."
+    MeasureOf = Val(token)
+End Function
+
+Private Function Snapped(ByVal measure As Double) As Double
+    ' A measure typed as the rounded route start or end means the exact start or end.
+    Snapped = measure
+    If Abs(measure - mRoute.Geometry.MMin) < 0.001 Then Snapped = mRoute.Geometry.MMin
+    If Abs(measure - mRoute.Geometry.MMax) < 0.001 Then Snapped = mRoute.Geometry.MMax
+End Function
+
+Private Sub CurrentEvent(ByRef eventType As String, ByRef fromMeasure As Double, ByRef toMeasure As Double)
+    If mRoute Is Nothing Then Err.Raise ERR_INPUT, "frmLrsEvent", "Choose a route first."
+    eventType = mEventType
+    fromMeasure = Snapped(MeasureOf(cboFrom))
+    If eventType = EVENT_LINEAR Then toMeasure = Snapped(MeasureOf(cboTo)) Else toMeasure = fromMeasure
+End Sub
+
+Private Sub ValidateEvent(ByVal eventType As String, ByVal fromMeasure As Double, ByVal toMeasure As Double)
+    Dim low As Double, high As Double, range As String
+    low = mRoute.Geometry.MMin - 0.0005: high = mRoute.Geometry.MMax + 0.0005
+    range = " is outside the route (" & FmtMeasure(mRoute.Geometry.MMin) & " to " & _
+            FmtMeasure(mRoute.Geometry.MMax) & " mi)."
+    If fromMeasure < low Or fromMeasure > high Then
+        Err.Raise ERR_INPUT, "frmLrsEvent", "From measure " & FmtMeasure(fromMeasure) & range
+    End If
+    If eventType = EVENT_LINEAR Then
+        If toMeasure < low Or toMeasure > high Then
+            Err.Raise ERR_INPUT, "frmLrsEvent", "To measure " & FmtMeasure(toMeasure) & range
+        End If
+        If toMeasure <= fromMeasure Then
+            Err.Raise ERR_INPUT, "frmLrsEvent", "To measure must be greater than From measure."
+        End If
+    End If
+End Sub
+
+Private Sub SyncEventType()
+    ' Colours the Linear / Point toggle: the chosen one is filled with the accent colour.
+    Dim isLinear As Boolean
+    isLinear = (mEventType = EVENT_LINEAR)
+    cmdLinear.BackColor = Pal(IIf(isLinear, "ACCENT", "INPUT_BG"))
+    cmdLinear.ForeColor = Pal(IIf(isLinear, "ON_ACCENT", "GHOST_TEXT"))
+    cmdLinear.Font.bold = isLinear
+    cmdPoint.BackColor = Pal(IIf(isLinear, "INPUT_BG", "ACCENT"))
+    cmdPoint.ForeColor = Pal(IIf(isLinear, "GHOST_TEXT", "ON_ACCENT"))
+    cmdPoint.Font.bold = Not isLinear
+End Sub
+
+Private Sub SetEventType(ByVal eventType As String)
+    mEventType = eventType
+    SyncEventType
+    RunAction "measures"
+End Sub
+
+Private Sub cmdLinear_Click()
+    SetEventType EVENT_LINEAR
+End Sub
+
+Private Sub cmdPoint_Click()
+    SetEventType EVENT_POINT
+End Sub
+
+Private Sub MeasuresEdited()
+    Dim isLinear As Boolean, eventType As String, fromMeasure As Double, toMeasure As Double
+    Dim lon As Double, lat As Double, parts As Long, gap As String, key As String
+    isLinear = (mEventType = EVENT_LINEAR)
+    lblTo.Visible = isLinear: cboTo.Visible = isLinear: lblToLocation.Visible = isLinear
+    cmdSwap.Visible = isLinear: cmdFull.Visible = isLinear
+    If Not isLinear Then mNextPick = "from"
+    SyncPickState
+    If mRoute Is Nothing Then Exit Sub
+    ' Choosing from the list and then leaving the box both report an edit; the preview is
+    ' rebuilt only when the event really changed.
+    key = mRoute.NameId & "|" & mEventType & "|" & Trim$(cboFrom.text) & "|"
+    If isLinear Then key = key & Trim$(cboTo.text)
+    mLastFromText = cboFrom.text: mLastToText = cboTo.text
+    If key = mLastEventKey Then Exit Sub
+    mLastEventKey = key
+    If mOfferOpen Then ShowOfferBar False
+    Erase mEventPreview: mEventPreviewCount = 0
+    lblFromLocation.Caption = ""
+    lblToLocation.Caption = ""
+    On Error GoTo Invalid
+    CurrentEvent eventType, fromMeasure, toMeasure
+    ValidateEvent eventType, fromMeasure, toMeasure
+    On Error GoTo 0
+
+    mRoute.Geometry.PointAt fromMeasure, lon, lat
+    lblFromLocation.Caption = FmtNum(lat, 4) & ", " & FmtNum(lon, 4)
+    If isLinear Then
+        mRoute.Geometry.PointAt toMeasure, lon, lat
+        lblToLocation.Caption = FmtNum(lat, 4) & ", " & FmtNum(lon, 4)
+        parts = mRoute.Geometry.SliceCount(fromMeasure, toMeasure)
+        If parts > 1 Then gap = "  " & ChrW$(183) & "  crosses a gap: " & parts & " elements"
+        SetEventHint "Event length " & FmtNum(toMeasure - fromMeasure, 3) & " mi of " & _
+                     FmtNum(mRoute.Geometry.MMax, 2) & " mi" & gap
+    Else
+        SetEventHint "Point event at the From measure."
+    End If
+    BuildEventPreview eventType, fromMeasure, toMeasure
+    Exit Sub
+Invalid:
+    If Err.number <> ERR_INPUT Then Err.Raise Err.number, Err.Source, Err.description
+    SetEventHint Err.description, True          ' shown beside the measures, not logged
+    Resume Finished
+Finished:
+End Sub
+
+Private Sub SwapMeasures()
+    Dim startText As String
+    mBusy = True
+    startText = cboFrom.text
+    cboFrom.text = cboTo.text
+    cboTo.text = startText
+    mBusy = False
+    MeasuresEdited
+End Sub
+
+Private Sub FullRoute()
+    If mRoute Is Nothing Then Err.Raise ERR_INPUT, "frmLrsEvent", "Choose a route first."
+    mBusy = True
+    cboFrom.text = FmtMeasure(mRoute.Geometry.MMin)
+    cboTo.text = FmtMeasure(mRoute.Geometry.MMax)
+    mBusy = False
+    mNextPick = "from"
+    MeasuresEdited
+End Sub
+
+Private Sub cmdSwap_Click()
+    RunAction "swap"
+End Sub
+
+Private Sub cmdFull_Click()
+    RunAction "full"
+End Sub
+
+Private Sub BuildEventPreview(ByVal eventType As String, ByVal fromMeasure As Double, ByVal toMeasure As Double)
+    Dim x As Double, y As Double, part As Variant
+    If mShape Is Nothing Then Exit Sub
+    Erase mEventPreview: mEventPreviewCount = 0
+    If eventType = EVENT_POINT Then
+        mShape.PointAt fromMeasure, x, y
+        AppendElement mEventPreview, mEventPreviewCount, PointElement(x, y, True, POINT_EVENT_COLOR, PREVIEW_PIN_WEIGHT)
+        Exit Sub
+    End If
+    For Each part In mShape.Slice(fromMeasure, toMeasure)
+        AppendLineStrings part, True, PREVIEW_EVENT_COLOR, PREVIEW_EVENT_WEIGHT, mEventPreview, mEventPreviewCount
+    Next part
+    mShape.PointAt toMeasure, x, y
+    AppendElement mEventPreview, mEventPreviewCount, PointElement(x, y, True, PREVIEW_TO_COLOR, PREVIEW_PIN_WEIGHT)
+    mShape.PointAt fromMeasure, x, y
+    AppendElement mEventPreview, mEventPreviewCount, PointElement(x, y, True, PREVIEW_FROM_COLOR, PREVIEW_PIN_WEIGHT)
+End Sub
+
+Private Sub MeasureKeyDown(ByVal KeyCode As MSForms.ReturnInteger)
+    mKeyHeld = True
+    If KeyCode.value = vbKeyReturn Then
+        mKeyHeld = False
+        KeyCode.value = 0
+        RunAction "measures"
+    End If
+End Sub
+
+Private Sub MeasureChange(ByVal combo As MSForms.ComboBox)
+    If mBusy Or mKeyHeld Then Exit Sub
+    If combo.ListIndex >= 0 Then RunAction "measures"       ' a stop was clicked in the list
+End Sub
+
+Private Sub MeasureExit()
+    mKeyHeld = False
+    If mBusy Or mRoute Is Nothing Then Exit Sub
+    If cboFrom.text <> mLastFromText Or cboTo.text <> mLastToText Then RunAction "measures"
+End Sub
+
+Private Sub cboFrom_KeyDown(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    MeasureKeyDown KeyCode
+End Sub
+
+Private Sub cboFrom_KeyUp(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    mKeyHeld = False
+End Sub
+
+Private Sub cboFrom_Change()
+    MeasureChange cboFrom
+End Sub
+
+Private Sub cboFrom_Exit(ByVal Cancel As MSForms.ReturnBoolean)
+    MeasureExit
+End Sub
+
+Private Sub cboTo_KeyDown(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    MeasureKeyDown KeyCode
+End Sub
+
+Private Sub cboTo_KeyUp(ByVal KeyCode As MSForms.ReturnInteger, ByVal Shift As Integer)
+    mKeyHeld = False
+End Sub
+
+Private Sub cboTo_Change()
+    MeasureChange cboTo
+End Sub
+
+Private Sub cboTo_Exit(ByVal Cancel As MSForms.ReturnBoolean)
+    MeasureExit
+End Sub
+
+' ---------------------------------------------------------------------------
+' Drawing
+' ---------------------------------------------------------------------------
+Private Sub Reproject()
+    Dim part As Long, source As clsLrsGeometry
+    Set mShape = Nothing
+    Erase mRoutePreview: mRoutePreviewCount = 0
+    Erase mEventPreview: mEventPreviewCount = 0
+    mLastEventKey = ""
+    cmdPick.Enabled = False: cmdZoom.Enabled = False
+    If mRoute Is Nothing Then Exit Sub
+    Set source = mRoute.Geometry
+    Log InitProjector(mCoordModes(cboCoords.ListIndex), mCoordCodes(cboCoords.ListIndex), _
+                      source.VX(source.PartStart(0)), source.VY(source.PartStart(0)))
+    Set mShape = ProjectGeometry(source)
+    For part = 0 To mShape.PartCount - 1
+        AppendLineStrings PartPoints(mShape, part), True, PREVIEW_ROUTE_COLOR, PREVIEW_ROUTE_WEIGHT, _
+                          mRoutePreview, mRoutePreviewCount
+    Next part
+    cmdPick.Enabled = True: cmdZoom.Enabled = True
+    MeasuresEdited
+    ZoomRoute
+    StartPickTool
+End Sub
+
+Private Sub cboCoords_Change()
+    If mBusy Then Exit Sub
+    Remember "coordinates", CoordKey(cboCoords.ListIndex)
+    RunAction "reproject"
+End Sub
+
+Private Sub ZoomRoute()
+    Dim xMin As Double, yMin As Double, xMax As Double, yMax As Double
+    If mShape Is Nothing Or NoZoom Then Exit Sub
+    mShape.Extent xMin, yMin, xMax, yMax
+    ZoomToExtent xMin, yMin, xMax, yMax
+End Sub
+
+Private Sub cmdZoom_Click()
+    RunAction "zoom"
+End Sub
+
+Private Sub StartPickTool()
+    If mShape Is Nothing Then Err.Raise ERR_INPUT, "frmLrsEvent", "Choose a route first."
+    If Not gLrsToolActive Then
+        mLastPrompt = ""
+        CommandState.StartPrimitive New clsLrsPickTool
+        Log "Pick tool started: move over the view to see the route, data point sets From then To, reset ends."
+    End If
+    SyncPickState
+End Sub
+
+Private Sub TogglePickTool()
+    ' The Pick button starts the tool, or stops it when it is running.
+    If gLrsToolActive Then
+        CommandState.StartDefaultCommand
+        SyncPickState
+    Else
+        StartPickTool
+    End If
+End Sub
+
+Private Sub cmdPick_Click()
+    RunAction "pick"
+End Sub
+
+Private Sub MarkPin(ByVal pin As MSForms.Label, ByVal text As String, ByVal isNext As Boolean, ByVal backKey As String)
+    If isNext Then
+        pin.Caption = ChrW$(&H25B6) & " " & ChrW$(&H25CF) & " " & text
+        pin.BackStyle = fmBackStyleOpaque
+        pin.BackColor = Pal(backKey)
+    Else
+        pin.Caption = "   " & ChrW$(&H25CF) & " " & text
+        pin.BackStyle = fmBackStyleTransparent
+    End If
+End Sub
+
+Private Sub SyncPickState()
+    ' Shows whether the pick tool is running and which measure the next pick sets.
+    Dim target As String
+    If gLrsToolActive Then
+        cmdPick.Caption = "Picking in drawing  " & ChrW$(183) & "  click to stop"
+        cmdPick.BackColor = Pal("PICK_BG"): cmdPick.ForeColor = Pal("TITLE")
+    Else
+        cmdPick.Caption = "Pick From / To in drawing"
+        cmdPick.BackColor = Pal("CARD"): cmdPick.ForeColor = Pal("GHOST_TEXT")
+    End If
+    cmdPick.Font.bold = gLrsToolActive
+    If mEventType = EVENT_LINEAR Then target = mNextPick Else target = "from"
+    MarkPin lblFrom, "From", gLrsToolActive And target = "from", "PIN_FROM_BG"
+    MarkPin lblTo, "To", gLrsToolActive And target = "to", "PIN_TO_BG"
+End Sub
+
+Public Function PickPrompt() As String
+    If mEventType = EVENT_POINT Then
+        PickPrompt = "LRS event: pick the point measure on the route"
+    Else
+        PickPrompt = "LRS event: pick the " & IIf(mNextPick = "from", "FROM", "TO") & " measure on the route"
+    End If
+End Function
+
+Public Sub DrawDynamics(ByVal x As Double, ByVal y As Double, ByVal drawMode As MsdDrawingMode)
+    ' Called by the pick tool for every cursor movement: draws the route, the event and
+    ' a dot at the nearest location on the route.
+    Dim i As Long, measure As Double, px As Double, py As Double, cursor As Element, prompt As String
+    If mShape Is Nothing Then Exit Sub
+    For i = 0 To mRoutePreviewCount - 1
+        mRoutePreview(i).Redraw drawMode
+    Next i
+    For i = 0 To mEventPreviewCount - 1
+        mEventPreview(i).Redraw drawMode
+    Next i
+    mShape.Locate x, y, measure, px, py
+    Set cursor = PointElement(px, py, True, PREVIEW_CURSOR_COLOR, PREVIEW_CURSOR_WEIGHT)
+    cursor.Redraw drawMode
+    prompt = PickPrompt() & "  MP " & FmtMeasure(measure)
+    If prompt <> mLastPrompt Then
+        mLastPrompt = prompt
+        ShowPrompt prompt
+    End If
+End Sub
+
+Public Sub OnPick(ByVal x As Double, ByVal y As Double)
+    ' Called by the pick tool for a data point.
+    Dim measure As Double, px As Double, py As Double, startMeasure As Double, finished As Boolean
+    If mShape Is Nothing Then Exit Sub
+    mShape.Locate x, y, measure, px, py
+    finished = (mEventType = EVENT_POINT Or mNextPick = "to")
+    mBusy = True
+    If mEventType = EVENT_POINT Then
+        cboFrom.text = FmtMeasure(measure)
+    ElseIf mNextPick = "from" Then
+        cboFrom.text = FmtMeasure(measure)
+        mNextPick = "to"
+    Else
+        cboTo.text = FmtMeasure(measure)
+        mNextPick = "from"
+        startMeasure = Val(cboFrom.text)
+        If measure < startMeasure Then
+            cboFrom.text = FmtMeasure(measure)
+            cboTo.text = FmtMeasure(startMeasure)
+        End If
+    End If
+    mBusy = False
+    Log "Picked MP " & FmtMeasure(measure) & "."
+    RunAction "measures"
+    If finished Then OfferCreate
+End Sub
+
+Private Sub OfferCreate()
+    ' After the last pick, asks in the dialog itself (not a modal box) whether to draw.
+    Dim eventType As String, fromMeasure As Double, toMeasure As Double, where As String
+    If mShape Is Nothing Then Exit Sub
+    On Error Resume Next
+    CurrentEvent eventType, fromMeasure, toMeasure
+    ValidateEvent eventType, fromMeasure, toMeasure
+    If Err.number <> 0 Then Exit Sub            ' the hint already explains why
+    On Error GoTo 0
+    where = "MP " & FmtMeasure(fromMeasure)
+    If eventType = EVENT_LINEAR Then where = where & " to " & FmtMeasure(toMeasure)
+    ShowOffer "  Draw " & mRoute.RouteName & " " & where & vbLf & "  in the MicroStation drawing?", _
+              "Yes, draw it", "create", "Not drawn - adjust the measures or pick again, or click Create alignment."
+    Log "Picked " & where & " - choose Yes, draw it or No below."
+End Sub
+
+Private Sub ShowOffer(ByVal text As String, ByVal yesText As String, ByVal action As String, ByVal declined As String)
+    ' Confirms inside the dialog; a MsgBox here would open under the busy (hourglass) cursor.
+    lblOffer.Caption = text
+    cmdOfferYes.Caption = yesText
+    mOfferAction = action
+    mOfferDeclined = declined
+    ShowOfferBar True
+End Sub
+
+Private Sub cmdOfferYes_Click()
+    Dim action As String
+    action = mOfferAction: mOfferAction = ""
+    ShowOfferBar False
+    If action <> "" Then RunAction action
+End Sub
+
+Private Sub cmdOfferNo_Click()
+    mOfferAction = ""
+    ShowOfferBar False
+    If mOfferDeclined <> "" Then Log mOfferDeclined Else Log "Cancelled."
+End Sub
+
+Public Sub OnToolStarted()
+    SyncPickState
+End Sub
+
+Public Sub OnToolEnded()
+    Log "Pick tool ended - the drawing preview is hidden."
+    SyncPickState
+End Sub
+
+Private Sub CreateEvent()
+    Dim eventType As String, fromMeasure As Double, toMeasure As Double, count As Long
+    CurrentEvent eventType, fromMeasure, toMeasure
+    ValidateEvent eventType, fromMeasure, toMeasure
+    If mShape Is Nothing Then
+        Err.Raise ERR_INPUT, "frmLrsEvent", "The route has not been converted to model coordinates."
+    End If
+    count = CreateEventElements(mRoute, mShape, eventType, fromMeasure, toMeasure, LabelsMode(), MilepostMode(), Me)
+    Log "SUCCESS - " & mRoute.RouteName & " MP " & FmtMeasure(fromMeasure) & " to " & FmtMeasure(toMeasure) & _
+        " created (" & count & " element(s))."
+End Sub
+
+Private Sub cmdCreate_Click()
+    RunAction "create"
+End Sub
+
+Private Sub DeleteCreated(ByVal confirm As Boolean)
+    Dim items As Collection, summary As String, deleted As Long
+    Set items = FindCreatedElements(summary)
+    If items.count = 0 Then
+        Log "Nothing to delete - the active model has no elements from this tool."
+        Exit Sub
+    End If
+    If confirm Then
+        ShowOffer "  Delete " & items.count & " element(s) this tool placed?" & vbLf & _
+                  "  " & summary & " (Undo brings them back)", "Yes, delete", "deletetest", "Nothing deleted."
+        Log "Delete " & items.count & " element(s)? Choose Yes, delete or No below."
+        Exit Sub
+    End If
+    deleted = DeleteCreatedElements(items)
+    Log "SUCCESS - deleted " & deleted & " element(s) placed by this tool (" & summary & ")."
+    ShowMessage "VDOT LRS: deleted " & deleted & " element(s).", summary, msdMessageCenterPriorityInfo, False
+End Sub
+
+Private Sub cmdDelete_Click()
+    RunAction "delete"
+End Sub
+
+' ---------------------------------------------------------------------------
+' Hooks for the self-test (modLrsSelfTest); not used by the dialog itself
+' ---------------------------------------------------------------------------
+Public Function TestChoose(ByVal which As String, ByVal text As String) As Boolean
+    ' Selects an entry by name the way a click in the list does.
+    Dim i As Long
+    If which = "jurisdiction" Then
+        For i = 0 To mJurCount - 1
+            If mJurNames(i) = text Then
+                mJurIndex = i: ShowSelection cboJurisdiction: RunAction "routes"
+                TestChoose = True: Exit Function
+            End If
+        Next i
+    Else
+        For i = 0 To mRouteCount - 1
+            If mRouteNames(i) = text Then
+                mRouteIndex = i: ShowSelection cboRoute: RunAction "route"
+                TestChoose = True: Exit Function
+            End If
+        Next i
+    End If
+End Function
+
+Public Function TestValue(ByVal what As String, Optional ByVal index As Long = 0) As Variant
+    Select Case what
+        Case "status": TestValue = lblStatus.Caption
+        Case "jurisdictions": TestValue = mJurCount
+        Case "jurisdiction": TestValue = mJurNames(index)
+        Case "routes": TestValue = mRouteCount
+        Case "route": TestValue = mRouteNames(index)
+        Case "routeText": TestValue = cboRoute.text
+        Case "routeList": TestValue = ListSummary(cboRoute)
+        Case "jurisdictionText": TestValue = cboJurisdiction.text
+        Case "jurisdictionList": TestValue = ListSummary(cboJurisdiction)
+        Case "routeHint": TestValue = lblRouteHint.Caption
+        Case "eventHint": TestValue = lblEventHint.Caption
+        Case "modelHint": TestValue = lblModelHint.Caption
+        Case "from": TestValue = cboFrom.text
+        Case "to": TestValue = cboTo.text
+        Case "fromLocation": TestValue = lblFromLocation.Caption
+        Case "toLocation": TestValue = lblToLocation.Caption
+        Case "coords": TestValue = cboCoords.text
+        Case "coordsCount": TestValue = cboCoords.ListCount
+        Case "loaded": TestValue = Not (mRoute Is Nothing)
+        Case "converted": TestValue = Not (mShape Is Nothing)
+        Case "routePreview": TestValue = mRoutePreviewCount
+        Case "eventPreview": TestValue = mEventPreviewCount
+        Case "log": TestValue = mLogText
+        Case "logLines": TestValue = mLogLines.count
+        Case "logOpen": TestValue = mLogOpen
+        Case "logGeometry"
+            TestValue = "frame " & fraLog.Width & " x " & fraLog.Height & " inside " & fraLog.InsideWidth & " x " & _
+                        fraLog.InsideHeight & " scroll " & fraLog.ScrollTop & " of " & fraLog.ScrollHeight & _
+                        " controls " & fraLog.Controls.count
+            If mLogLines.count > 0 Then
+                TestValue = TestValue & " | last " & mLogLines(mLogLines.count).Left & ", " & _
+                            mLogLines(mLogLines.count).Top & " " & mLogLines(mLogLines.count).Width & " x " & _
+                            mLogLines(mLogLines.count).Height & " visible " & mLogLines(mLogLines.count).Visible & _
+                            " | first " & mLogLines(1).Top & " " & mLogLines(1).Width & " x " & mLogLines(1).Height
+            End If
+        Case "eventHintError": TestValue = (lblEventHint.Tag = "hinterror")
+        Case "toVisible": TestValue = cboTo.Visible
+        Case "oppositeEnabled": TestValue = RouteHasOpposite()
+        Case "routeId": If mRoute Is Nothing Then TestValue = "" Else TestValue = mRoute.NameId
+        Case "pickCaption": TestValue = cmdPick.Caption
+        Case "fromLabel": TestValue = Len(lblFrom.Caption) & IIf(lblFrom.BackStyle = fmBackStyleOpaque, " marked", " plain")
+        Case "toLabel": TestValue = Len(lblTo.Caption) & IIf(lblTo.BackStyle = fmBackStyleOpaque, " marked", " plain")
+        Case "labels": TestValue = cboLabels.text
+        Case "mileposts": TestValue = cboMileposts.text
+        Case "createEnabled": TestValue = cmdCreate.Enabled
+        Case "logoShown": TestValue = imgLogo.Visible
+        Case "width": TestValue = Me.Width
+        Case "height": TestValue = Me.Height
+    End Select
+End Function
+
+Public Sub TestSet(ByVal what As String, ByVal value As String)
+    mBusy = True
+    Select Case what
+        Case "from": cboFrom.text = value
+        Case "to": cboTo.text = value
+        Case "type": mEventType = value: SyncEventType
+        Case "coords": cboCoords.ListIndex = CLng(value)
+        Case "labels": cboLabels.ListIndex = CLng(value)
+        Case "mileposts": cboMileposts.ListIndex = CLng(value)
+        Case "theme": cboTheme.ListIndex = CLng(value)
+    End Select
+    mBusy = False
+    Select Case what
+        Case "from", "to", "type": RunAction "measures"
+        Case "coords": RunAction "reproject"
+        Case "theme": ApplyTheme
+    End Select
+End Sub
+
+Private Function ListSummary(ByVal combo As MSForms.ComboBox) As String
+    Dim i As Long
+    ListSummary = combo.ListCount & " rows"
+    For i = 0 To combo.ListCount - 1
+        If i < 4 Then ListSummary = ListSummary & "; " & combo.List(i, 0)
+    Next i
+End Function
+
+Public Sub TestFocus(ByVal which As String)
+    If which = "jurisdiction" Then cboJurisdiction.SetFocus Else cboRoute.SetFocus
+End Sub
+
+Public Sub TestClick(ByVal which As String)
+    Select Case which
+        Case "swap": cmdSwap_Click
+        Case "full": cmdFull_Click
+        Case "opposite": cmdOpposite_Click
+        Case "pick": cmdPick_Click
+        Case "log": lblLogToggle_Click
+    End Select
+End Sub
+
+Public Sub TestLog(ByVal message As String)
+    Log message
+End Sub
+
+Public Sub TestCreate()
+    RunAction "create"
+End Sub
+
+Public Sub TestDelete()
+    RunAction "delete"
+End Sub
+
+Public Sub TestPick(ByVal x As Double, ByVal y As Double)
+    OnPick x, y
+End Sub
+
+Public Function TestLastOffer() As String
+    If mOfferOpen Then TestLastOffer = Replace(Replace(lblOffer.Caption, vbLf, ""), "  ", " ")
+End Function
+
+Public Sub TestOffer(ByVal yes As Boolean)
+    If yes Then cmdOfferYes_Click Else cmdOfferNo_Click
+End Sub
+
+Public Sub TestLocate(ByVal measure As Double, ByRef x As Double, ByRef y As Double)
+    If Not mShape Is Nothing Then mShape.PointAt measure, x, y
+End Sub

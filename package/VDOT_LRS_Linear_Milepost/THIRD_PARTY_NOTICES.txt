@@ -1,0 +1,18 @@
+THIRD-PARTY NOTICES - VDOT LRS Linear Milepost
+==============================================
+
+The wheels folder contains unmodified binary wheels downloaded from PyPI:
+
+  PyQt5 5.15.10        Riverbank Computing Ltd.   GNU GPL v3
+                       https://www.riverbankcomputing.com/software/pyqt/
+  PyQt5-Qt5 5.15.2     The Qt Company Ltd.        GNU LGPL v3 (Qt libraries)
+                       https://www.qt.io/
+  PyQt5-sip 12.x       Riverbank Computing Ltd.   BSD-2-Clause / SIP licence
+
+Each wheel carries its full licence text in its .dist-info folder. Source code
+is available from the URLs above and from https://pypi.org/.
+
+These wheels are installed only when the Python that ships with MicroStation /
+OpenRoads has no PyQt5. Bentley's own PyQt5 (PyQt5-commercial) is never
+replaced. Anyone redistributing this package with the bundled GPL PyQt5 must
+comply with the GPL v3 terms.
